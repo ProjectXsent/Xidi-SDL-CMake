@@ -1,0 +1,639 @@
+/***************************************************************************************************
+ * Xidi
+ *   DirectInput interface for XInput controllers.
+ ***************************************************************************************************
+ * Authored by Samuel Grossman
+ * Copyright (c) 2016-2024
+ ***********************************************************************************************//**
+ * @file PhysicalController.cpp
+ *   Implementation of all functionality for communicating with physical controllers.
+ *
+ *   NOTE: This is a modified version of the original Xidi v4.3.1 source file. The physical
+ *   controller read/write backend has been converted from the Windows XInput API to SDL3's
+ *   gamepad API (SDL_Gamepad). Everything not directly related to talking to the controller
+ *   hardware (threading model, polling cadence, force feedback plumbing, Windows timer
+ *   resolution handling, etc.) has been left unchanged.
+ **************************************************************************************************/
+
+#include "PhysicalController.h"
+
+#include <cstdint>
+#include <mutex>
+#include <set>
+#include <stop_token>
+#include <thread>
+
+#include <Infra/Core/Message.h>
+
+// SDL3 replaces ImportApiXInput.h / XInput as the physical controller read/write backend.
+// Adjust this include if SDL3 headers are exposed differently in your build.
+#include <SDL3/SDL.h>
+
+#include "ApiWindows.h"
+#include "ConcurrencyWrapper.h"
+#include "ControllerTypes.h"
+#include "ForceFeedbackDevice.h"
+#include "Globals.h"
+#include "ImportApiWinMM.h"
+#include "Mapper.h"
+#include "Strings.h"
+#include "VirtualController.h"
+
+namespace Xidi
+{
+  namespace Controller
+  {
+    /// Raw physical state data for each of the possible physical controllers.
+    static ConcurrencyWrapper<SPhysicalState> physicalControllerState[kPhysicalControllerCount];
+
+    /// State data for each of the possible physical controllers after it is passed through a mapper
+    /// but without any further processing.
+    static ConcurrencyWrapper<SState> rawVirtualControllerState[kPhysicalControllerCount];
+
+    /// Per-controller force feedback device buffer objects.
+    /// These objects are not safe for dynamic initialization, so they are initialized later by
+    /// pointer.
+    static ForceFeedback::Device* physicalControllerForceFeedbackBuffer;
+
+    /// Pointers to the virtual controller objects registered for force feedback with each physical
+    /// controller.
+    static std::set<const VirtualController*>
+        physicalControllerForceFeedbackRegistration[kPhysicalControllerCount];
+
+    /// Mutex objects for protecting against concurrent accesses to the physical controller force
+    /// feedback registration data.
+    static std::mutex physicalControllerForceFeedbackMutex[kPhysicalControllerCount];
+
+    /// SDL_Gamepad handles for each of the possible physical controller slots, indexed the same way
+    /// XInput controller indices were (0 through kPhysicalControllerCount - 1). Opened lazily and
+    /// re-opened automatically if a device is detached and a new one shows up in the same slot.
+    static SDL_Gamepad* sdlGamepads[kPhysicalControllerCount] = {};
+
+    /// Guards all access to the SDL joystick/gamepad subsystem. Unlike XInputGetState and
+    /// XInputSetState, which Microsoft documents as safe to call concurrently from multiple
+    /// threads, this file polls each controller from its own dedicated thread and conservatively
+    /// serializes all SDL_Gamepad* calls through this mutex.
+    static std::mutex sdlControllerMutex;
+
+    /// Computes an opaque source identifier from a given controller identifier.
+    /// @param [in] controllerIdentifier Identifier of the physical controller for which an
+    /// identifier is needed.
+    /// @return Opaque identifier that can be passed to mappers.
+    static inline uint32_t OpaqueControllerSourceIdentifier(
+        TControllerIdentifier controllerIdentifier)
+    {
+      return (uint32_t)controllerIdentifier;
+    }
+
+    /// Retrieves (opening it if necessary) the SDL_Gamepad handle associated with a physical
+    /// controller slot. Must be called with #sdlControllerMutex held.
+    /// @param [in] controllerIdentifier Identifier of the controller slot on which to operate.
+    /// @return Open and connected gamepad handle for the slot, or `nullptr` if no suitable device
+    /// is currently present.
+    static SDL_Gamepad* GetOpenGamepadUnsafe(TControllerIdentifier controllerIdentifier)
+    {
+      SDL_UpdateGamepads();
+
+      SDL_Gamepad* gamepad = sdlGamepads[controllerIdentifier];
+
+      if ((nullptr != gamepad) && (false == SDL_GamepadConnected(gamepad)))
+      {
+        SDL_CloseGamepad(gamepad);
+        gamepad = nullptr;
+        sdlGamepads[controllerIdentifier] = nullptr;
+      }
+
+      if (nullptr == gamepad)
+      {
+        // SDL3 no longer has integer joystick device indices. Devices are identified by
+        // SDL_JoystickID instance IDs instead, and SDL_GetJoysticks returns the list of those
+        // that are currently attached. This treats physical controller slot numbers as positions
+        // in that list, which mirrors the fixed 4-slot model XInput used. Positions in the list
+        // are not stable identifiers the way XInput's controller indices were: they can shift
+        // whenever a device is added or removed elsewhere in the system. For a closer match to
+        // XInput's behavior (a device keeps its slot until it disconnects), track devices by
+        // instance ID using SDL_EVENT_GAMEPAD_ADDED / SDL_EVENT_GAMEPAD_REMOVED events instead.
+        int sdlJoystickCount = 0;
+        SDL_JoystickID* const sdlJoystickIds = SDL_GetJoysticks(&sdlJoystickCount);
+
+        if (nullptr != sdlJoystickIds)
+        {
+          if (((int)controllerIdentifier < sdlJoystickCount) &&
+              (true == SDL_IsGamepad(sdlJoystickIds[controllerIdentifier])))
+          {
+            gamepad = SDL_OpenGamepad(sdlJoystickIds[controllerIdentifier]);
+            sdlGamepads[controllerIdentifier] = gamepad;
+          }
+
+          SDL_free(sdlJoystickIds);
+        }
+      }
+
+      return gamepad;
+    }
+
+    /// Reads physical controller state.
+    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
+    /// @return Physical state of the identified controller.
+    static SPhysicalState ReadPhysicalControllerState(TControllerIdentifier controllerIdentifier)
+    {
+      // Bit layout mirrors the original XInput-based implementation:
+      //   bits 0-3: dpad up/down/left/right, bit 4: start, bit 5: back,
+      //   bit 6: left thumb, bit 7: right thumb, bit 8: left shoulder, bit 9: right shoulder,
+      //   bits 10-11: unused (guide, share), bits 12-15: A, B, X, Y.
+      // SDL_Gamepad exposes buttons individually rather than as a single register, so the mask is
+      // built up below one button at a time instead of being taken directly from a hardware
+      // bitfield.
+      constexpr uint16_t kUnusedButtonMask =
+          ~((uint16_t)((1u << (unsigned int)EPhysicalButton::UnusedGuide) |
+                       (1u << (unsigned int)EPhysicalButton::UnusedShare)));
+
+      std::unique_lock lock(sdlControllerMutex);
+
+      SDL_Gamepad* const gamepad = GetOpenGamepadUnsafe(controllerIdentifier);
+      if (nullptr == gamepad) return {.deviceStatus = EPhysicalDeviceStatus::NotConnected};
+
+      const int16_t stickLX = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTX);
+      const int16_t stickLY = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY);
+      const int16_t stickRX = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTX);
+      const int16_t stickRY = SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHTY);
+
+      // SDL trigger axes report 0 to 32767 (unlike the signed -32768 to 32767 stick axes), so
+      // scale down into the same 0-255 byte range XInput's bLeftTrigger/bRightTrigger used.
+      const uint8_t triggerL =
+          (uint8_t)(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) >> 7);
+      const uint8_t triggerR =
+          (uint8_t)(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) >> 7);
+
+      // SDL3 names the four face buttons by position rather than by label: SOUTH/EAST/WEST/NORTH
+      // correspond to the Xbox layout's A/B/X/Y, which is what XInput used.
+      uint16_t buttons = 0;
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_UP))
+        buttons |= (1u << (unsigned int)EPhysicalButton::DpadUp);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_DOWN))
+        buttons |= (1u << (unsigned int)EPhysicalButton::DpadDown);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_LEFT))
+        buttons |= (1u << (unsigned int)EPhysicalButton::DpadLeft);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_DPAD_RIGHT))
+        buttons |= (1u << (unsigned int)EPhysicalButton::DpadRight);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_START))
+        buttons |= (1u << (unsigned int)EPhysicalButton::Start);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_BACK))
+        buttons |= (1u << (unsigned int)EPhysicalButton::Back);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_LEFT_STICK))
+        buttons |= (1u << (unsigned int)EPhysicalButton::LS);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_RIGHT_STICK))
+        buttons |= (1u << (unsigned int)EPhysicalButton::RS);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER))
+        buttons |= (1u << (unsigned int)EPhysicalButton::LB);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER))
+        buttons |= (1u << (unsigned int)EPhysicalButton::RB);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_SOUTH))
+        buttons |= (1u << (unsigned int)EPhysicalButton::A);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_EAST))
+        buttons |= (1u << (unsigned int)EPhysicalButton::B);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_WEST))
+        buttons |= (1u << (unsigned int)EPhysicalButton::X);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_NORTH))
+        buttons |= (1u << (unsigned int)EPhysicalButton::Y);
+
+      // Unlike XInput, SDL can also report the guide button and, on some controllers (Xbox
+      // Series/PS5) via SDL_GAMEPAD_BUTTON_MISC1, a share/capture button. Both are filled in here
+      // for completeness but are masked out below by kUnusedButtonMask to preserve the original
+      // behavior. Remove them from the mask if these two buttons should be surfaced.
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_GUIDE))
+        buttons |= (1u << (unsigned int)EPhysicalButton::UnusedGuide);
+      if (SDL_GetGamepadButton(gamepad, SDL_GAMEPAD_BUTTON_MISC1))
+        buttons |= (1u << (unsigned int)EPhysicalButton::UnusedShare);
+
+      return {
+          .deviceStatus = EPhysicalDeviceStatus::Ok,
+          .stick = {stickLX, stickLY, stickRX, stickRY},
+          .trigger = {triggerL, triggerR},
+          .button = (uint16_t)(buttons & kUnusedButtonMask)};
+    }
+
+    /// Scales a vibration strength value by the specified scaling factor. If the resulting strength
+    /// exceeds the maximum possible strength it is saturated at the maximum possible strength.
+    /// @param [in] vibrationStrength Physical motor vibration strength value.
+    /// @param [in] scalingFactor Scaling factor by which to scale up or down the physical motor
+    /// vibration strength value.
+    /// @return Scaled physical motor vibration strength value that can then be sent directly to the
+    /// physical motor.
+    static ForceFeedback::TPhysicalActuatorValue ScaledVibrationStrength(
+        ForceFeedback::TPhysicalActuatorValue vibrationStrength, double scalingFactor)
+    {
+      if (0.0 == scalingFactor)
+        return 0;
+      else if (1.0 == scalingFactor)
+        return static_cast<ForceFeedback::TPhysicalActuatorValue>(vibrationStrength);
+
+      constexpr double kMaxVibrationStrength =
+          static_cast<double>(std::numeric_limits<ForceFeedback::TPhysicalActuatorValue>::max());
+      const double scaledVibrationStrength = static_cast<double>(vibrationStrength) * scalingFactor;
+
+      return static_cast<ForceFeedback::TPhysicalActuatorValue>(
+          std::min(scaledVibrationStrength, kMaxVibrationStrength));
+    }
+
+    /// Writes a vibration command to a physical controller.
+    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
+    /// @param [in] vibration Physical actuator vibration vector.
+    /// @return `true` if successful, `false` otherwise.
+    static bool WritePhysicalControllerVibration(
+        TControllerIdentifier controllerIdentifier,
+        ForceFeedback::SPhysicalActuatorComponents vibration)
+    {
+      static const double kForceFeedbackEffectStrengthScalingFactor =
+          static_cast<double>(
+              Globals::GetConfigurationData()
+                  .GetFirstIntegerValue(
+                      Strings::kStrConfigurationSectionProperties,
+                      Strings::kStrConfigurationSettingPropertiesForceFeedbackEffectStrengthPercent)
+                  .value_or(100)) /
+          100.0;
+
+      // Impulse triggers are ignored because SDL_RumbleGamepad does not support them; a controller
+      // that supports trigger-specific haptics could instead be driven via
+      // SDL_RumbleGamepadTriggers.
+      const Uint16 leftMotorSpeed = (Uint16)ScaledVibrationStrength(
+          vibration.leftMotor, kForceFeedbackEffectStrengthScalingFactor);
+      const Uint16 rightMotorSpeed = (Uint16)ScaledVibrationStrength(
+          vibration.rightMotor, kForceFeedbackEffectStrengthScalingFactor);
+
+      std::unique_lock lock(sdlControllerMutex);
+
+      SDL_Gamepad* const gamepad = GetOpenGamepadUnsafe(controllerIdentifier);
+      if (nullptr == gamepad) return false;
+
+      // SDL_RumbleGamepad needs an explicit duration, unlike XInputSetState which just sets the
+      // motors and leaves them running until told otherwise. This is refreshed every time the
+      // caller's loop notices a state change, so a duration a few periods longer than the force
+      // feedback actuation period keeps the motors running smoothly between updates without
+      // needing to re-issue an identical command every single cycle.
+      constexpr Uint32 kRumbleDurationMilliseconds = 4 * kPhysicalForceFeedbackPeriodMilliseconds;
+
+      // Unlike SDL2's SDL_GameControllerRumble (0 on success), SDL_RumbleGamepad returns `true` on
+      // success.
+      return SDL_RumbleGamepad(gamepad, leftMotorSpeed, rightMotorSpeed, kRumbleDurationMilliseconds);
+    }
+
+    /// Periodically plays force feedback effects on the physical controller actuators.
+    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
+    static void ForceFeedbackActuateEffects(TControllerIdentifier controllerIdentifier)
+    {
+      constexpr ForceFeedback::TOrderedMagnitudeComponents kVirtualMagnitudeVectorZero = {};
+
+      ForceFeedback::SPhysicalActuatorComponents previousPhysicalActuatorValues;
+      ForceFeedback::SPhysicalActuatorComponents currentPhysicalActuatorValues;
+
+      const Mapper* mapper = Mapper::GetConfigured(controllerIdentifier);
+      bool lastActuationResult = true;
+
+      while (true)
+      {
+        if (true == lastActuationResult)
+          Sleep(kPhysicalForceFeedbackPeriodMilliseconds);
+        else
+          Sleep(kPhysicalErrorBackoffPeriodMilliseconds);
+
+        if (true == Globals::DoesCurrentProcessHaveInputFocus())
+        {
+          ForceFeedback::TEffectValue overallEffectGain = 10000;
+          ForceFeedback::SPhysicalActuatorComponents physicalActuatorVector = {};
+          ForceFeedback::TOrderedMagnitudeComponents virtualMagnitudeVector =
+              physicalControllerForceFeedbackBuffer[controllerIdentifier].PlayEffects();
+
+          if (kVirtualMagnitudeVectorZero != virtualMagnitudeVector)
+          {
+            std::unique_lock lock(physicalControllerForceFeedbackMutex[controllerIdentifier]);
+
+            // Gain is modified downwards by each virtual controller object.
+            // Typically there would only be one, in which case the properties of that object would
+            // be effective. Otherwise this loop is essentially modeled as multiple volume knobs
+            // connected in sequence, each lowering the volume of the effects by the value of its
+            // own device-wide gain property.
+            for (auto virtualController :
+                 physicalControllerForceFeedbackRegistration[controllerIdentifier])
+              overallEffectGain *=
+                  ((ForceFeedback::TEffectValue)virtualController->GetForceFeedbackGain() /
+                   ForceFeedback::kEffectModifierMaximum);
+
+            physicalActuatorVector = mapper->MapForceFeedbackVirtualToPhysical(
+                virtualMagnitudeVector, overallEffectGain);
+          }
+
+          currentPhysicalActuatorValues = physicalActuatorVector;
+        }
+        else
+        {
+          currentPhysicalActuatorValues = {};
+        }
+
+        if (previousPhysicalActuatorValues != currentPhysicalActuatorValues)
+        {
+          lastActuationResult =
+              WritePhysicalControllerVibration(controllerIdentifier, currentPhysicalActuatorValues);
+          previousPhysicalActuatorValues = currentPhysicalActuatorValues;
+        }
+        else
+        {
+          lastActuationResult = true;
+        }
+      }
+    }
+
+    /// Periodically polls for physical controller state.
+    /// On detected state change, updates the internal data structure and notifies all waiting
+    /// threads.
+    /// @param [in] controllerIdentifier Identifier of the controller on which to operate.
+    static void PollForPhysicalControllerStateChanges(TControllerIdentifier controllerIdentifier)
+    {
+      SPhysicalState newPhysicalState = physicalControllerState[controllerIdentifier].Get();
+
+      while (true)
+      {
+        if (EPhysicalDeviceStatus::Ok == newPhysicalState.deviceStatus)
+          Sleep(kPhysicalPollingPeriodMilliseconds);
+        else
+          Sleep(kPhysicalErrorBackoffPeriodMilliseconds);
+
+        newPhysicalState = ReadPhysicalControllerState(controllerIdentifier);
+
+        if (true == physicalControllerState[controllerIdentifier].Update(newPhysicalState))
+        {
+          const SState newRawVirtualState =
+              ((EPhysicalDeviceStatus::Ok == newPhysicalState.deviceStatus)
+                   ? Mapper::GetConfigured(controllerIdentifier)
+                         ->MapStatePhysicalToVirtual(
+                             newPhysicalState,
+                             OpaqueControllerSourceIdentifier(controllerIdentifier))
+                   : Mapper::GetConfigured(controllerIdentifier)
+                         ->MapNeutralPhysicalToVirtual(
+                             OpaqueControllerSourceIdentifier(controllerIdentifier)));
+
+          rawVirtualControllerState[controllerIdentifier].Update(newRawVirtualState);
+        }
+      }
+    }
+
+    /// Monitors physical controller status for events like hardware connection or disconnection and
+    /// error conditions. Used exclusively for logging. Intended to be a thread entry point, one
+    /// thread per monitored physical controller.
+    /// @param [in] controllerIdentifier Identifier of the controller to monitor.
+    static void MonitorPhysicalControllerStatus(TControllerIdentifier controllerIdentifier)
+    {
+      if (controllerIdentifier >= kPhysicalControllerCount)
+      {
+        Infra::Message::OutputFormatted(
+            Infra::Message::ESeverity::Error,
+            L"Attempted to monitor physical controller with invalid identifier %u.",
+            controllerIdentifier);
+        return;
+      }
+
+      SPhysicalState oldPhysicalState = GetCurrentPhysicalControllerState(controllerIdentifier);
+      SPhysicalState newPhysicalState = oldPhysicalState;
+
+      while (true)
+      {
+        WaitForPhysicalControllerStateChange(
+            controllerIdentifier, newPhysicalState, std::stop_token());
+
+        // Look for status changes and output to the log, as appropriate.
+        switch (newPhysicalState.deviceStatus)
+        {
+          case EPhysicalDeviceStatus::Ok:
+            switch (oldPhysicalState.deviceStatus)
+            {
+              case EPhysicalDeviceStatus::Ok:
+                break;
+
+              case EPhysicalDeviceStatus::NotConnected:
+                Infra::Message::OutputFormatted(
+                    Infra::Message::ESeverity::Info,
+                    L"Physical controller %u: Hardware connected.",
+                    (1 + controllerIdentifier));
+                break;
+
+              default:
+                Infra::Message::OutputFormatted(
+                    Infra::Message::ESeverity::Warning,
+                    L"Physical controller %u: Cleared previous error condition.",
+                    (1 + controllerIdentifier));
+                break;
+            }
+            break;
+
+          case EPhysicalDeviceStatus::NotConnected:
+            if (newPhysicalState.deviceStatus != oldPhysicalState.deviceStatus)
+              Infra::Message::OutputFormatted(
+                  Infra::Message::ESeverity::Info,
+                  L"Physical controller %u: Hardware disconnected.",
+                  (1 + controllerIdentifier));
+            break;
+
+          default:
+            if (newPhysicalState.deviceStatus != oldPhysicalState.deviceStatus)
+              Infra::Message::OutputFormatted(
+                  Infra::Message::ESeverity::Warning,
+                  L"Physical controller %u: Encountered an error condition.",
+                  (1 + controllerIdentifier));
+            break;
+        }
+
+        oldPhysicalState = newPhysicalState;
+      }
+    }
+
+    /// Initializes internal data structures and creates worker threads.
+    /// Idempotent and concurrency-safe.
+    static void Initialize(void)
+    {
+      static std::once_flag initFlag;
+      std::call_once(
+          initFlag,
+          []() -> void
+          {
+            // Initialize SDL's gamepad subsystem (this transitively initializes the joystick
+            // subsystem as well, so no separate SDL_INIT_JOYSTICK call is needed). This replaces
+            // the implicit initialization that used to happen the first time ImportApiXInput
+            // resolved the XInput DLL's entry points. SDL3's SDL_InitSubSystem returns `true` on
+            // success, the opposite sense of SDL2's zero-on-success convention.
+            {
+              std::unique_lock lock(sdlControllerMutex);
+              if (false == SDL_InitSubSystem(SDL_INIT_GAMEPAD))
+              {
+                Infra::Message::OutputFormatted(
+                    Infra::Message::ESeverity::Error,
+                    L"Failed to initialize the SDL gamepad subsystem: %S",
+                    SDL_GetError());
+              }
+            }
+
+            // Initialize controller state data structures.
+            for (auto controllerIdentifier = 0;
+                 controllerIdentifier < _countof(physicalControllerState);
+                 ++controllerIdentifier)
+            {
+              const SPhysicalState initialPhysicalState =
+                  ReadPhysicalControllerState(controllerIdentifier);
+              const SState initialRawVirtualState =
+                  Mapper::GetConfigured(controllerIdentifier)
+                      ->MapStatePhysicalToVirtual(
+                          initialPhysicalState,
+                          OpaqueControllerSourceIdentifier(controllerIdentifier));
+
+              physicalControllerState[controllerIdentifier].Set(initialPhysicalState);
+              rawVirtualControllerState[controllerIdentifier].Set(initialRawVirtualState);
+            }
+
+            // Ensure the system timer resolution is suitable for the desired polling frequency.
+            TIMECAPS timeCaps;
+            MMRESULT timeResult = ImportApiWinMM::timeGetDevCaps(&timeCaps, sizeof(timeCaps));
+            if (MMSYSERR_NOERROR == timeResult)
+            {
+              timeResult = ImportApiWinMM::timeBeginPeriod(timeCaps.wPeriodMin);
+
+              if (MMSYSERR_NOERROR == timeResult)
+                Infra::Message::OutputFormatted(
+                    Infra::Message::ESeverity::Info,
+                    L"Set the system timer resolution to %u ms.",
+                    timeCaps.wPeriodMin);
+              else
+                Infra::Message::OutputFormatted(
+                    Infra::Message::ESeverity::Warning,
+                    L"Failed with code %u to set the system timer resolution.",
+                    timeResult);
+            }
+            else
+            {
+              Infra::Message::OutputFormatted(
+                  Infra::Message::ESeverity::Warning,
+                  L"Failed with code %u to obtain system timer resolution information.",
+                  timeResult);
+            }
+
+            // Create and start the polling threads.
+            for (auto controllerIdentifier = 0; controllerIdentifier < kPhysicalControllerCount;
+                 ++controllerIdentifier)
+            {
+              std::thread(PollForPhysicalControllerStateChanges, controllerIdentifier).detach();
+              Infra::Message::OutputFormatted(
+                  Infra::Message::ESeverity::Info,
+                  L"Initialized the physical controller state polling thread for controller %u. Desired polling period is %u ms.",
+                  (unsigned int)(1 + controllerIdentifier),
+                  kPhysicalPollingPeriodMilliseconds);
+            }
+
+            // Allocate the force feedback device buffers, then create and start the force feedback
+            // threads.
+            physicalControllerForceFeedbackBuffer =
+                new ForceFeedback::Device[kPhysicalControllerCount];
+            for (auto controllerIdentifier = 0; controllerIdentifier < kPhysicalControllerCount;
+                 ++controllerIdentifier)
+            {
+              std::thread(ForceFeedbackActuateEffects, controllerIdentifier).detach();
+              Infra::Message::OutputFormatted(
+                  Infra::Message::ESeverity::Info,
+                  L"Initialized the physical controller force feedback actuation thread for controller %u. Desired actuation period is %u ms.",
+                  (unsigned int)(1 + controllerIdentifier),
+                  kPhysicalForceFeedbackPeriodMilliseconds);
+            }
+
+            // Create and start the physical controller hardware status monitoring threads, but only
+            // if the messages generated by those threads will actually be delivered as output.
+            if (Infra::Message::WillOutputMessageOfSeverity(Infra::Message::ESeverity::Warning))
+            {
+              for (auto controllerIdentifier = 0; controllerIdentifier < kPhysicalControllerCount;
+                   ++controllerIdentifier)
+              {
+                std::thread(MonitorPhysicalControllerStatus, controllerIdentifier).detach();
+                Infra::Message::OutputFormatted(
+                    Infra::Message::ESeverity::Info,
+                    L"Initialized the physical controller hardware status monitoring thread for controller %u.",
+                    (unsigned int)(1 + controllerIdentifier));
+              }
+            }
+          });
+    }
+
+    SCapabilities GetControllerCapabilities(TControllerIdentifier controllerIdentifier)
+    {
+      Initialize();
+      return Mapper::GetConfigured(controllerIdentifier)->GetCapabilities();
+    }
+
+    SPhysicalState GetCurrentPhysicalControllerState(TControllerIdentifier controllerIdentifier)
+    {
+      Initialize();
+      return physicalControllerState[controllerIdentifier].Get();
+    }
+
+    SState GetCurrentRawVirtualControllerState(TControllerIdentifier controllerIdentifier)
+    {
+      Initialize();
+      return rawVirtualControllerState[controllerIdentifier].Get();
+    }
+
+    ForceFeedback::Device* PhysicalControllerForceFeedbackRegister(
+        TControllerIdentifier controllerIdentifier, const VirtualController* virtualController)
+    {
+      Initialize();
+
+      if (controllerIdentifier >= kPhysicalControllerCount)
+      {
+        Infra::Message::OutputFormatted(
+            Infra::Message::ESeverity::Error,
+            L"Attempted to register with a physical controller for force feedback with invalid identifier %u.",
+            controllerIdentifier);
+        return nullptr;
+      }
+
+      std::unique_lock lock(physicalControllerForceFeedbackMutex[controllerIdentifier]);
+      physicalControllerForceFeedbackRegistration[controllerIdentifier].insert(virtualController);
+
+      return &physicalControllerForceFeedbackBuffer[controllerIdentifier];
+    }
+
+    void PhysicalControllerForceFeedbackUnregister(
+        TControllerIdentifier controllerIdentifier, const VirtualController* virtualController)
+    {
+      Initialize();
+
+      if (controllerIdentifier >= kPhysicalControllerCount)
+      {
+        Infra::Message::OutputFormatted(
+            Infra::Message::ESeverity::Error,
+            L"Attempted to unregister with a physical controller for force feedback with invalid identifier %u.",
+            controllerIdentifier);
+        return;
+      }
+
+      std::unique_lock lock(physicalControllerForceFeedbackMutex[controllerIdentifier]);
+      physicalControllerForceFeedbackRegistration[controllerIdentifier].erase(virtualController);
+    }
+
+    bool WaitForPhysicalControllerStateChange(
+        TControllerIdentifier controllerIdentifier,
+        SPhysicalState& state,
+        std::stop_token stopToken)
+    {
+      Initialize();
+
+      if (controllerIdentifier >= kPhysicalControllerCount) return false;
+
+      return physicalControllerState[controllerIdentifier].WaitForUpdate(state, stopToken);
+    }
+
+    bool WaitForRawVirtualControllerStateChange(
+        TControllerIdentifier controllerIdentifier, SState& state, std::stop_token stopToken)
+    {
+      Initialize();
+
+      if (controllerIdentifier >= kPhysicalControllerCount) return false;
+
+      return rawVirtualControllerState[controllerIdentifier].WaitForUpdate(state, stopToken);
+    }
+  } // namespace Controller
+} // namespace Xidi
