@@ -1,8 +1,6 @@
 # Building Xidi with CMake
 
-This repository builds with CMake only. The original Visual Studio solution and project files are
-still available in the first commit of the Git history (`Xidi.sln`, `*.vcxproj`, `Properties/`).
-`Modules/Infra` keeps its own Visual Studio files.
+This repository builds with CMake only.
 
 ## Requirements
 
