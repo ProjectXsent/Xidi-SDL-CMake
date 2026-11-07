@@ -28,3 +28,8 @@ Xidi is not useful if:
 ## Further Reading
 
 See the [Wiki](https://github.com/samuelgr/Xidi/wiki) for complete documentation.
+
+
+## Credits
+- Samuelgr ([Xidi](https://github.com/samuelgr/Xidi))
+- libsdl-org ([SDL](https://github.com/libsdl-org/sdl))
