@@ -10,8 +10,6 @@ This repository builds with CMake only.
 
 ## SDL3
 
-SDL3 is not vendored as a library (only its headers are, in `ThirdParty/SDL3`). Give CMake one of:
-
 | Option | Use when |
 | --- | --- |
 | `-DXIDI_SDL3_ROOT=C:/path/SDL3-3.x.y` | You extracted an `SDL3-devel-*-VC.zip` from the SDL releases page. Expects `include/` and `lib/x64`, `lib/x86`. |
