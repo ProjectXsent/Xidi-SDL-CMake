@@ -4,6 +4,8 @@ Xidi improves the gameplay experience when using modern SDL-based controllers (S
 
 Xidi is implemented as a library that games should load instead of the system-supplied versions. As such, it is a very localized fix: no installation is required, and no persistent system-wide changes are made.
 
+>This build is based on Xidi v4.3.1 so there will be no Xidi.32.dll/Xidi.64.dll implemented.
+
 
 ## Key Features
 
