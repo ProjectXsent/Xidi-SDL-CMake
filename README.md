@@ -1,6 +1,6 @@
 # Xidi SDL
 
-Xidi improves the gameplay experience when using modern SDL-based controllers (SDL-based controllers (such as Xbox, PlayStation, Switch, Google Stadia, 8BitDo, GameSir, Amazon Luna, Steam Controller, etc.)) with older games that use DirectInput or WinMM to communicate with game controllers. In more technical terms, Xidi provides both DirectInput and WinMM interfaces for games to use and communicates with SDL-based game controllers natively using SDL, translating between the two interfaces as needed.
+Xidi improves the gameplay experience when using modern SDL-based controllers (such as Xbox, PlayStation, Switch, Google Stadia, 8BitDo, GameSir, Amazon Luna, Steam Controller, etc.) with older games that use DirectInput or WinMM to communicate with game controllers. In more technical terms, Xidi provides both DirectInput and WinMM interfaces for games to use and communicates with SDL-based game controllers natively using SDL, translating between the two interfaces as needed.
 
 Xidi is implemented as a library that games should load instead of the system-supplied versions. As such, it is a very localized fix: no installation is required, and no persistent system-wide changes are made.
 
